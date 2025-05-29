@@ -1,0 +1,2 @@
+Utility scripts to automate deployment tasks, validation, and environment setup.
+Examples include scripts to package and deploy CloudFormation stacks or to bootstrap Terraform environments.
