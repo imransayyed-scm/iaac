@@ -24,3 +24,20 @@ README.md
 
 🚀 Getting Started:
 Refer to the README in each subdirectory for setup instructions and usage examples.
+
+**Prerequisites:**
+AWS CLI configured with appropriate credentials
+Terraform installed (version X.X or higher)
+Necessary IAM permissions for resource creation
+
+**Deploying CloudFormation:**
+aws cloudformation deploy --template-file cfn/vpc.yaml --stack-name my-vpc-stack --parameter-overrides Key=Value
+
+**Using Terraform:**
+cd terraform/environments/dev
+terraform init
+terraform plan
+terraform apply
+
+**Contributing**
+Feel free to submit issues or pull requests for improvements, bug fixes, or additional modules.
