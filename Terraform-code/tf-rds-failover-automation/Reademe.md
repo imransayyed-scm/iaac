@@ -53,3 +53,14 @@ module "rds_failover_automation" {
     Project     = "FailoverAutomation"
   }
 }
+
+aws ssm start-automation-execution \
+    --document-name "RDS-Force-Failover" \ # Or your custom name
+    --parameters \
+        "DBInstanceIdentifier=your-rds-id,\
+AutomationAssumeRole=arn:aws:iam::YOUR_ACCOUNT_ID:role/SSM-RDS-Failover-AutomationRole,\
+TargetSecurityGroupId=sg-yoursecuritygroupid,\
+DrInstance1CidrIp=your_dr_instance1_ip/32,\
+DrInstance2CidrIp=your_dr_instance2_ip/32,\
+LambdaFunctionName=RegisterTargetsAfterRDSAvailable" \
+    --region your-aws-region
