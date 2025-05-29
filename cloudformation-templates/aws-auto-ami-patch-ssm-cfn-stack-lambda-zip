@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Parameterized CloudFormation template to deploy:
+    - SSM Automation Document (AwsAutoAmiPatchSsmDoc)
+    - IAM Roles
+    - Lambda function for sanity testing (aws-auto-ami-patch-ssm-sanitytest)
+    - SNS topic with email subscription
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SNS notifications.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket where Lambda ZIP is stored.
+    Default: 007628705973-pchfl-cloud-infra
+
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key of the Lambda deployment ZIP file.
+    Default: lambda/aws-auto-ami-patch-sanity/aws-auto-ami-patch-ssm-sanitytest-v1.1.zip
+
+Resources:
+
+  #######################
+  # SNS Topic & Subscription
+  #######################
+  SanityTestSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-auto-ami-patch-ssm-sanitytest-sns-topic
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      KmsMasterKeyId: alias/aws/sns
+
+  #######################
+  # IAM Role for SSM Automation
+  #######################
+  AutomationIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AwsAutoAmiPatchSsmDoc-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSMDocumentExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage,
+                  - ec2:DescribeImages,
+                  - ec2:DescribeInstances,
+                  - ec2:CreateTags,
+                  - ec2:DeleteTags,
+                  - ssm:SendCommand,
+                  - ssm:ListCommands,
+                  - ssm:ListCommandInvocations,
+                  - ssm:GetAutomationExecution,
+                  - ssm:StartAutomationExecution,
+                  - ssm:DescribeInstanceInformation,
+                  - sns:Publish,
+                  - lambda:InvokeFunction,
+                  - iam:PassRole
+                Resource: '*'
+
+  #######################
+  # SSM Automation Document
+  #######################
+  SSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: AwsAutoAmiPatchSsmDoc
+      Content:
+        description: |
+          This Automation workflow safely creates a backup (AMI) of the target EC2 instance before applying patches.
+          It ensures that patching operations only proceed after the AMI is successfully created.
+          After patching, it invokes a Lambda function to perform a sanity check and sends results via SNS.
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+          AutomationAssumeRole:
+            type: String
+        mainSteps:
+          - name: CreateAMI
+            action: aws:createImage
+            nextStep: WaitForAMIAvailable
+            inputs:
+              InstanceId: '{{ InstanceId }}'
+              ImageName: Backup-{{ InstanceId }}-{{ global:DATE_TIME }}
+              NoReboot: true
+
+          - name: WaitForAMIAvailable
+            action: aws:waitForAwsResourceProperty
+            timeoutSeconds: 1200
+            nextStep: RunPatchBaseline
+            inputs:
+              Service: ec2
+              Api: DescribeImages
+              PropertySelector: $.Images[0].State
+              DesiredValues:
+                - available
+              ImageIds:
+                - '{{ CreateAMI.ImageId }}'
+
+          - name: RunPatchBaseline
+            action: aws:runCommand
+            nextStep: SanityCheck
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                Operation: Install
+
+          - name: SanityCheck
+            action: aws:invokeLambdaFunction
+            isEnd: true
+            inputs:
+              FunctionName: aws-auto-ami-patch-ssm-sanitytest
+              Payload: '{"instance_id": "{{ InstanceId }}"}'
+
+  #######################
+  # IAM Role for Lambda
+  #######################
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-auto-ami-patch-ssm-sanitytest-iamrole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSSMPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+
+  #######################
+  # Lambda Function for Sanity Test
+  #######################
+  SanityTestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-auto-ami-patch-ssm-sanitytest
+      Role: !GetAtt LambdaIAMRole.Arn
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SanityTestSNSTopic
+
+Outputs:
+  SSMDocumentName:
+    Description: Name of the created SSM Automation document
+    Value: !Ref SSMDocument
+
+  SNSTopicARN:
+    Description: SNS topic ARN for receiving patching updates
+    Value: !Ref SanityTestSNSTopic
+
+  LambdaFunctionName:
+    Description: Sanity test Lambda function name
+    Value: !Ref SanityTestLambda
+
+  AutomationRole:
+    Description: IAM role for Automation document execution
+    Value: !GetAtt AutomationIAMRole.Arn
