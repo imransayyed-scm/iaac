@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Full CloudFormation stack for AMI backup, patching, sanity test, and notification.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive SNS notifications.
+    Default: "imran.sayyed@piramal.com"
+
+  Entity:
+    Type: String
+    Default: "Retail"
+
+  Environment:
+    Type: String
+    Default: "Development"
+
+  Team:
+    Type: String
+    Default: "Shared_Infra"
+
+  Owner:
+    Type: String
+    Default: "Nitin Kamble"
+
+Resources:
+
+  AutoPatchSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aws-auto-ami-patch-ssm-sanitytest-sns-topic
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Entity
+          Value: !Ref Entity
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: Owner
+          Value: !Ref Owner
+
+  SanityTestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-auto-ami-patch-ssm-sanitytest-iamrole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowSNSPublishAndSSM
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+      Tags:
+        - Key: Entity
+          Value: !Ref Entity
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: Owner
+          Value: !Ref Owner
+
+  SanityTestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-auto-ami-patch-ssm-sanitytest
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 300
+      Role: !GetAtt SanityTestLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+
+          ssm_client = boto3.client('ssm')
+          sns_client = boto3.client('sns')
+
+          SNS_TOPIC_ARN = "arn:aws:sns:ap-south-1:007628705973:aws-auto-ami-patch-ssm-sanitytest-sns-topic"
+
+          def lambda_handler(event, context):
+              instance_id = event.get("instance_id", "unknown")
+
+              commands = [
+                  "df -TH",
+                  "free -m",
+                  "netstat -plant",
+                  "systemctl list-units --type=service --state=running"
+              ]
+
+              try:
+                  response = ssm_client.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName="AWS-RunShellScript",
+                      Parameters={
+                          'commands': commands
+                      }
+                  )
+
+                  command_id = response['Command']['CommandId']
+                  output = get_command_output(instance_id, command_id)
+
+                  message = f"? Sanity Test Output for Instance {instance_id}:\n\n"
+                  message += output
+
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=message,
+                      Subject="AWS Auto. AMI, Patching & Sanity Test Results"
+                  )
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "status": "ok",
+                          "message": "Sanity test executed successfully, results sent to SNS."
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({
+                          "status": "error",
+                          "message": f"Error executing sanity test: {str(e)}"
+                      })
+                  }
+
+          def get_command_output(instance_id, command_id, timeout=60, interval=5):
+              elapsed = 0
+              while elapsed < timeout:
+                  try:
+                      response = ssm_client.get_command_invocation(
+                          InstanceId=instance_id,
+                          CommandId=command_id
+                      )
+                      status = response['Status']
+                      if status in ['Success', 'Failed', 'TimedOut', 'Cancelled']:
+                          output = f"SSM Command Status: {status}\n\n"
+                          output += "Standard Output:\n"
+                          output += response.get('StandardOutputContent', 'No output\n')
+                          if response.get('StandardErrorContent'):
+                              output += "\nStandard Error:\n"
+                              output += response.get('StandardErrorContent', 'None')
+                          return output
+                      else:
+                          time.sleep(interval)
+                          elapsed += interval
+                  except ssm_client.exceptions.InvocationDoesNotExist:
+                      time.sleep(interval)
+                      elapsed += interval
+              return "Error: Timeout while waiting for command to finish."
+      Tags:
+        - Key: Entity
+          Value: !Ref Entity
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: Owner
+          Value: !Ref Owner
+
+  PatchAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-auto-ami-patch-ssm-doc-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowSSMActions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ssm:SendCommand
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                  - ssm:GetAutomationExecution
+                  - ssm:StartAutomationExecution
+                  - ssm:DescribeInstanceInformation
+                  - sns:Publish
+                  - lambda:InvokeFunction
+                  - iam:PassRole
+                Resource: "*"
+      Tags:
+        - Key: Entity
+          Value: !Ref Entity
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: Owner
+          Value: !Ref Owner
+
+  PatchAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: AwsAutoAmiPatchSsmDocument
+      UpdateMethod: NewVersion
+      Content:
+        description: |
+          This Automation workflow safely creates a backup (AMI) of the target EC2 instance before applying patches.
+          It ensures that patching operations only proceed after the AMI is successfully created.
+          After patching, it invokes a Lambda function to perform a sanity check and sends results via SNS.
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+          AutomationAssumeRole:
+            type: String
+        mainSteps:
+          - name: CreateAMI
+            action: aws:createImage
+            nextStep: WaitForAMIAvailable
+            inputs:
+              InstanceId: '{{ InstanceId }}'
+              ImageName: Backup-{{ InstanceId }}-{{ global:DATE_TIME }}
+              NoReboot: true
+
+          - name: WaitForAMIAvailable
+            action: aws:waitForAwsResourceProperty
+            timeoutSeconds: 1200
+            nextStep: RunPatchBaseline
+            inputs:
+              Service: ec2
+              Api: DescribeImages
+              PropertySelector: $.Images[0].State
+              DesiredValues:
+                - available
+              ImageIds:
+                - '{{ CreateAMI.ImageId }}'
+
+          - name: RunPatchBaseline
+            action: aws:runCommand
+            nextStep: NotifyAmiAndPatchResult
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                Operation: Install
+
+          - name: NotifyAmiAndPatchResult
+            action: aws:executeAwsApi
+            nextStep: SanityCheck
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: !Ref AutoPatchSnsTopic
+              Message: |
+                ? AMI Backup and Patching are completed, Sanity check is in progress:
+                Instance ID: {{ InstanceId }}
+                AMI ID: {{ CreateAMI.ImageId }}
+                Automation Execution ID: {{ automation:EXECUTION_ID }}
+
+          - name: SanityCheck
+            action: aws:invokeLambdaFunction
+            isEnd: true
+            inputs:
+              FunctionName: aws-auto-ami-patch-ssm-sanitytest
+              Payload: '{"instance_id": "{{ InstanceId }}"}'
+
+Outputs:
+
+  SanityTestLambdaArn:
+    Description: ARN of the Sanity Test Lambda Function
+    Value: !GetAtt SanityTestLambda.Arn
+    Export:
+      Name: SanityTestLambdaArn
+
+  SanityTestLambdaName:
+    Description: Name of the Sanity Test Lambda Function
+    Value: !Ref SanityTestLambda
+    Export:
+      Name: SanityTestLambdaName
+
+  SanityTestLambdaRoleArn:
+    Description: ARN of the IAM Role for the Sanity Test Lambda
+    Value: !GetAtt SanityTestLambdaRole.Arn
+    Export:
+      Name: SanityTestLambdaRoleArn
+
+  PatchAutomationRoleArn:
+    Description: ARN of the IAM Role for Patch Automation
+    Value: !GetAtt PatchAutomationRole.Arn
+    Export:
+      Name: PatchAutomationRoleArn
+
+  PatchAutomationDocumentName:
+    Description: Name of the SSM Automation Document
+    Value: !Ref PatchAutomationDocument
+    Export:
+      Name: PatchAutomationDocumentName
+
+  SnsTopicArn:
+    Description: ARN of the SNS Topic for Notifications
+    Value: !Ref AutoPatchSnsTopic
+    Export:
+      Name: AutoPatchSnsTopicArn
+
+  SnsTopicName:
+    Description: Name of the SNS Topic for Notifications
+    Value: !Sub "${AutoPatchSnsTopic.TopicName}"
+    Export:
+      Name: AutoPatchSnsTopicName
