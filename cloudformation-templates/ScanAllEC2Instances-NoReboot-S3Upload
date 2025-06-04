@@ -1,12 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Deploys an SSM Automation Document to scan all SSM-managed EC2 instances without reboot,
-  log per-instance patch compliance data, and upload results to a specific S3 bucket.
+Description: |
+  Deploys an SSM Automation Document that scans all SSM-managed EC2 instances without reboot, uploads per-instance patch compliance data to an S3 bucket via a Lambda function, and logs results.
 
 Parameters:
   S3BucketName:
     Type: String
-    Default: "pchfl-ssm-patching-artifacts-3p-uat"
+    Default: pchfl-ssm-patching-artifacts-3p-uat
     Description: S3 bucket name for storing patch scan reports
 
 Resources:
@@ -32,10 +31,74 @@ Resources:
                   - ssm:DescribeInstanceInformation
                   - ssm:DescribeInstancePatchStates
                   - ssm:SendCommand
+                  - ssm:ListCommands
                   - ssm:GetCommandInvocation
                   - ec2:DescribeInstances
                   - s3:PutObject
-                Resource: "*"
+                  - lambda:InvokeFunction
+                Resource: '*'
+
+  UploadPatchScanReportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: UploadPatchScanReportLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UploadToS3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  UploadPatchScanReportToS3:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UploadPatchScanReportToS3
+      Runtime: python3.12
+      Role: !GetAtt UploadPatchScanReportLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = event['BucketName']
+              compliance_data = event['PatchCompliance']
+              timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+              key = f"patch-scan-report-{timestamp}.json"
+
+              if isinstance(compliance_data, str):
+                  compliance_data = json.loads(compliance_data)
+
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=key,
+                  Body=json.dumps(compliance_data, indent=2)
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': f'Report uploaded to s3://{bucket_name}/{key}'
+              }
 
   PatchScanSSMDocument:
     Type: AWS::SSM::Document
@@ -44,9 +107,8 @@ Resources:
       Name: ScanAllEC2Instances-NoReboot-S3Upload
       Content:
         schemaVersion: '0.3'
-        description: >
-          Scans all Systems Manager managed EC2 instances for missing patches using Patch Manager without rebooting.
-          Logs patch compliance per instance and uploads the results to an S3 bucket.
+        description: |
+          Scans all Systems Manager managed EC2 instances for missing patches using Patch Manager without rebooting. Logs patch compliance per instance and uploads the results to an S3 bucket.
         assumeRole: '{{ AutomationAssumeRole }}'
         parameters:
           AutomationAssumeRole:
@@ -63,17 +125,17 @@ Resources:
               Api: DescribeInstanceInformation
             outputs:
               - Name: InstanceIds
-                Selector: "$..InstanceId"
+                Selector: $..InstanceId
                 Type: StringList
 
           - name: runPatchScan
             action: aws:runCommand
             inputs:
               DocumentName: AWS-RunPatchBaseline
-              InstanceIds: "{{ getManagedInstances.InstanceIds }}"
+              InstanceIds: '{{ getManagedInstances.InstanceIds }}'
               Parameters:
-                Operation: "Scan"
-                RebootOption: "NoReboot"
+                Operation: Scan
+                RebootOption: NoReboot
             timeoutSeconds: 600
 
           - name: getComplianceData
@@ -81,10 +143,10 @@ Resources:
             inputs:
               Service: ssm
               Api: DescribeInstancePatchStates
-              InstanceIds: "{{ getManagedInstances.InstanceIds }}"
+              InstanceIds: '{{ getManagedInstances.InstanceIds }}'
             outputs:
               - Name: PatchCompliance
-                Selector: "$"
+                Selector: $
                 Type: String
 
           - name: logCompliance
@@ -105,3 +167,7 @@ Outputs:
   AutomationRoleARN:
     Description: ARN of the IAM role for executing the SSM Automation
     Value: !GetAtt SSMScanAutomationRole.Arn
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function that uploads compliance results to S3
+    Value: !Ref UploadPatchScanReportToS3
