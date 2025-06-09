@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Self-contained CloudFormation stack to automate EC2 patch scans using AWS SSM.
+  Results are stored in S3. Triggered via EventBridge on weekdays at 8:45 PM IST.
+
+Resources:
+
+  PatchScanBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ec2-patch-automation
+      VersioningConfiguration:
+        Status: Enabled
+
+  PatchScanLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PatchScanLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PatchScanLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ssm:SendCommand
+                  - ssm:ListCommandInvocations
+                  - ssm:GetInstancePatchStates
+                  - s3:PutObject
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  PatchScanLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PatchScanLambda
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 900
+      Role: !GetAtt PatchScanLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+          import time
+          
+          ec2 = boto3.client('ec2')
+          ssm = boto3.client('ssm')
+          s3 = boto3.client('s3')
+          
+          BUCKET_NAME = "ec2-patch-automation"
+          S3_KEY_PREFIX = "scans"
+          
+          def lambda_handler(event, context):
+              today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+              s3_key = f"{S3_KEY_PREFIX}/{today}-scan-results.json"
+              
+              tag_filters = [
+                  {'Name': 'tag:PatchScanAutomation', 'Values': ['Enabled']},
+                  {'Name': 'tag:PatchScanAutomationWindow', 'Values': ['Daily']},
+                  {'Name': 'instance-state-name', 'Values': ['running']}
+              ]
+              
+              instances = ec2.describe_instances(Filters=tag_filters)
+              instance_ids = [
+                  i['InstanceId']
+                  for r in instances['Reservations']
+                  for i in r['Instances']
+              ]
+              
+              if not instance_ids:
+                  return {"message": "No matching EC2 instances found."}
+              
+              response = ssm.send_command(
+                  InstanceIds=instance_ids,
+                  DocumentName="AWS-RunPatchBaseline",
+                  Parameters={"Operation": ["Scan"]},
+                  TimeoutSeconds=600
+              )
+              
+              command_id = response['Command']['CommandId']
+              
+              # Wait for command completion
+              max_attempts = 40
+              sleep_time = 15
+              for _ in range(max_attempts):
+                  time.sleep(sleep_time)
+                  invocations = ssm.list_command_invocations(
+                      CommandId=command_id,
+                      Details=True
+                  )
+                  statuses = [i['Status'] for i in invocations['CommandInvocations']]
+                  if all(s in ['Success', 'Failed', 'Cancelled', 'TimedOut'] for s in statuses):
+                      break
+              
+              compliance_summary = []
+              for instance_id in instance_ids:
+                  try:
+                      result = ssm.get_instance_patch_states(InstanceIds=[instance_id])
+                      state = result['InstancePatchStates'][0]
+                      compliance_summary.append({
+                          'InstanceId': instance_id,
+                          'PatchGroup': state.get('PatchGroup', 'N/A'),
+                          'InstalledCount': state.get('InstalledCount', 0),
+                          'MissingCount': state.get('MissingCount', 0),
+                          'FailedCount': state.get('FailedCount', 0),
+                          'OperationStartTime': str(state.get('OperationStartTime')),
+                          'OperationEndTime': str(state.get('OperationEndTime')),
+                          'ComplianceStatus': state.get('ComplianceStatus'),
+                      })
+                  except Exception as e:
+                      compliance_summary.append({
+                          'InstanceId': instance_id,
+                          'Error': str(e)
+                      })
+              
+              s3.put_object(
+                  Bucket=BUCKET_NAME,
+                  Key=s3_key,
+                  Body=json.dumps(compliance_summary, indent=2),
+                  ContentType='application/json'
+              )
+              
+              return {
+                  'message': f"Patch scan complete for {len(instance_ids)} instances",
+                  's3_result_path': f"s3://{BUCKET_NAME}/{s3_key}",
+                  'results': compliance_summary
+              }
+
+  PatchScanLambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PatchScanWeekdaySchedule
+      # Runs at 8:45 PM IST (15:15 UTC), Monday to Thursday
+      ScheduleExpression: cron(15 15 ? * 2-5 *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PatchScanLambdaFunction.Arn
+          Id: PatchScanLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PatchScanLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PatchScanLambdaSchedule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Patch Scan Lambda Function
+    Value: !Ref PatchScanLambdaFunction
+
+  S3BucketName:
+    Description: S3 bucket for scan results
+    Value: !Ref PatchScanBucket
