@@ -1,6 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: |
-  Full CloudFormation stack for EC2 patch scanning using SSM. Sends scan results to S3 and notifies AppOwner via SNS and SES, tracking email subscriptions via DynamoDB.
+Description: >
+  Full CloudFormation stack for EC2 patch scanning using SSM.
+  Sends scan results to S3 and notifies AppOwner via SNS and SES, tracking email subscriptions via DynamoDB.
 
 Resources:
 
@@ -55,13 +56,13 @@ Resources:
                   - sns:Subscribe
                   - dynamodb:GetItem
                   - dynamodb:PutItem
-                Resource: '*'
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: '*'
+                Resource: "*"
 
   PatchScanLambdaFunction:
     Type: AWS::Lambda::Function
@@ -210,7 +211,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: PatchScanWeekdaySchedule
-      ScheduleExpression: cron(30 10 ? * 2-5 *) # 4:00 PM IST
+      ScheduleExpression: cron(30 9 ? * 2-5 *)  # 3:00 PM IST
       State: ENABLED
       Targets:
         - Arn: !GetAtt PatchScanLambdaFunction.Arn
