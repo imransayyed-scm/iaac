@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  Self-contained CloudFormation stack to automate EC2 patch scans using AWS SSM. Results are stored in S3. Triggered via EventBridge on weekdays at 8:45 PM IST.
+  Full CloudFormation stack for EC2 patch scanning using SSM. Sends scan results to S3 and notifies AppOwner via SNS and SES, tracking email subscriptions via DynamoDB.
 
 Resources:
 
@@ -10,6 +10,23 @@ Resources:
       BucketName: ec2-patch-automation
       VersioningConfiguration:
         Status: Enabled
+
+  SubscribedEmailsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SubscribedEmails
+      AttributeDefinitions:
+        - AttributeName: Email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Email
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  DailyPatchScanSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: daily-patch-scan-result
 
   PatchScanLambdaRole:
     Type: AWS::IAM::Role
@@ -32,9 +49,12 @@ Resources:
                   - ec2:DescribeInstances
                   - ssm:SendCommand
                   - ssm:ListCommandInvocations
-                  - ssm:GetInstancePatchStates
                   - ssm:DescribeInstancePatchStates
                   - s3:PutObject
+                  - sns:Publish
+                  - sns:Subscribe
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -51,19 +71,40 @@ Resources:
       Runtime: python3.12
       Timeout: 900
       Role: !GetAtt PatchScanLambdaRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: ec2-patch-automation
+          S3_KEY_PREFIX: scans
+          SNS_TOPIC_ARN: !Ref DailyPatchScanSNSTopic
+          DDB_TABLE_NAME: SubscribedEmails
       Code:
         ZipFile: |
           import boto3
           import json
           import datetime
           import time
+          import os
 
           ec2 = boto3.client('ec2')
           ssm = boto3.client('ssm')
           s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          ddb = boto3.client('dynamodb')
 
-          BUCKET_NAME = "ec2-patch-automation"
-          S3_KEY_PREFIX = "scans"
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+          S3_KEY_PREFIX = os.environ['S3_KEY_PREFIX']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          DDB_TABLE_NAME = os.environ['DDB_TABLE_NAME']
+
+          def is_email_subscribed(email):
+              try:
+                  response = ddb.get_item(
+                      TableName=DDB_TABLE_NAME,
+                      Key={'Email': {'S': email}}
+                  )
+                  return 'Item' in response
+              except Exception as e:
+                  return False
 
           def lambda_handler(event, context):
               today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
@@ -76,11 +117,18 @@ Resources:
               ]
 
               instances = ec2.describe_instances(Filters=tag_filters)
-              instance_ids = [
-                  i['InstanceId']
-                  for r in instances['Reservations']
-                  for i in r['Instances']
-              ]
+              instance_map = {}
+              instance_ids = []
+
+              for reservation in instances['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      instance_ids.append(instance_id)
+                      tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
+                      instance_map[instance_id] = {
+                          'AppOwner': tags.get('AppOwner'),
+                          'Tags': tags
+                      }
 
               if not instance_ids:
                   return {"message": "No matching EC2 instances found."}
@@ -94,11 +142,8 @@ Resources:
 
               command_id = response['Command']['CommandId']
 
-              # Wait for command completion
-              max_attempts = 40
-              sleep_time = 15
-              for _ in range(max_attempts):
-                  time.sleep(sleep_time)
+              for _ in range(40):
+                  time.sleep(15)
                   invocations = ssm.list_command_invocations(
                       CommandId=command_id,
                       Details=True
@@ -108,12 +153,12 @@ Resources:
                       break
 
               compliance_summary = []
+
               for instance_id in instance_ids:
                   try:
-                      #result = ssm.get_instance_patch_states(InstanceIds=[instance_id])
                       result = ssm.describe_instance_patch_states(InstanceIds=[instance_id])
                       state = result['InstancePatchStates'][0]
-                      compliance_summary.append({
+                      summary = {
                           'InstanceId': instance_id,
                           'PatchGroup': state.get('PatchGroup', 'N/A'),
                           'InstalledCount': state.get('InstalledCount', 0),
@@ -122,7 +167,26 @@ Resources:
                           'OperationStartTime': str(state.get('OperationStartTime')),
                           'OperationEndTime': str(state.get('OperationEndTime')),
                           'ComplianceStatus': state.get('ComplianceStatus'),
-                      })
+                      }
+                      compliance_summary.append(summary)
+
+                      app_owner = instance_map[instance_id].get('AppOwner')
+                      if app_owner and "@" in app_owner and not is_email_subscribed(app_owner):
+                          sns.subscribe(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Protocol='email',
+                              Endpoint=app_owner
+                          )
+                          ddb.put_item(
+                              TableName=DDB_TABLE_NAME,
+                              Item={'Email': {'S': app_owner}}
+                          )
+                      if app_owner and "@" in app_owner:
+                          sns.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Subject=f"[PatchScan] {instance_id} - {summary['ComplianceStatus']}",
+                              Message=json.dumps(summary, indent=2)
+                          )
                   except Exception as e:
                       compliance_summary.append({
                           'InstanceId': instance_id,
@@ -146,8 +210,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: PatchScanWeekdaySchedule
-      # Runs at 8:45 PM IST (15:15 UTC), Monday to Thursday
-      ScheduleExpression: cron(50 15 ? * 2-5 *)
+      ScheduleExpression: cron(30 10 ? * 2-5 *) # 4:00 PM IST
       State: ENABLED
       Targets:
         - Arn: !GetAtt PatchScanLambdaFunction.Arn
@@ -169,3 +232,11 @@ Outputs:
   S3BucketName:
     Description: S3 bucket for scan results
     Value: !Ref PatchScanBucket
+
+  SNSTopic:
+    Description: SNS Topic for AppOwner patch results
+    Value: !Ref DailyPatchScanSNSTopic
+
+  DynamoDBTable:
+    Description: DynamoDB table for tracking subscribed emails
+    Value: !Ref SubscribedEmailsTable
