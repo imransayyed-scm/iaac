@@ -1,18 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  Full CloudFormation stack for EC2 patch scanning using SSM.
-  Sends scan results to S3 and notifies AppOwner via SNS and SES, tracking email subscriptions via DynamoDB.
+Description: EC2 Patch Scan Automation with SES Email Notifications
 
 Resources:
 
-  PatchScanBucket:
+  PatchScanS3Bucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: ec2-patch-automation
-      VersioningConfiguration:
-        Status: Enabled
 
-  SubscribedEmailsTable:
+  PatchScanDynamoDB:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: SubscribedEmails
@@ -23,11 +19,6 @@ Resources:
         - AttributeName: Email
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
-
-  DailyPatchScanSNSTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: daily-patch-scan-result
 
   PatchScanLambdaRole:
     Type: AWS::IAM::Role
@@ -40,6 +31,8 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: PatchScanLambdaPolicy
           PolicyDocument:
@@ -49,53 +42,44 @@ Resources:
                 Action:
                   - ec2:DescribeInstances
                   - ssm:SendCommand
-                  - ssm:ListCommandInvocations
                   - ssm:DescribeInstancePatchStates
-                  - s3:PutObject
-                  - sns:Publish
-                  - sns:Subscribe
                   - dynamodb:GetItem
                   - dynamodb:PutItem
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
+                  - s3:PutObject
+                  - ses:SendEmail
+                Resource: '*'
 
-  PatchScanLambdaFunction:
+  PatchScanLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: PatchScanLambda
+      FunctionName: PatchScanEmailer
       Handler: index.lambda_handler
       Runtime: python3.12
-      Timeout: 900
       Role: !GetAtt PatchScanLambdaRole.Arn
+      Timeout: 300
       Environment:
         Variables:
-          BUCKET_NAME: ec2-patch-automation
-          S3_KEY_PREFIX: scans
-          SNS_TOPIC_ARN: !Ref DailyPatchScanSNSTopic
-          DDB_TABLE_NAME: SubscribedEmails
+          DDB_TABLE_NAME: !Ref PatchScanDynamoDB
+          S3_BUCKET_NAME: !Ref PatchScanS3Bucket
+          SES_SENDER: noreply@piramal.info
       Code:
         ZipFile: |
           import boto3
+          import os
           import json
           import datetime
           import time
-          import os
+          import botocore
 
           ec2 = boto3.client('ec2')
           ssm = boto3.client('ssm')
-          s3 = boto3.client('s3')
-          sns = boto3.client('sns')
           ddb = boto3.client('dynamodb')
+          s3 = boto3.client('s3')
+          ses = boto3.client('ses', region_name='ap-south-1')
 
-          BUCKET_NAME = os.environ['BUCKET_NAME']
-          S3_KEY_PREFIX = os.environ['S3_KEY_PREFIX']
-          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
           DDB_TABLE_NAME = os.environ['DDB_TABLE_NAME']
+          S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+          SES_SENDER = os.environ['SES_SENDER']
 
           def is_email_subscribed(email):
               try:
@@ -105,139 +89,103 @@ Resources:
                   )
                   return 'Item' in response
               except Exception as e:
+                  print(f"DynamoDB check error for {email}: {e}")
                   return False
 
           def lambda_handler(event, context):
-              today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
-              s3_key = f"{S3_KEY_PREFIX}/{today}-scan-results.json"
+              today = datetime.datetime.now().strftime("%Y-%m-%d")
 
-              tag_filters = [
-                  {'Name': 'tag:PatchScanAutomation', 'Values': ['Enabled']},
-                  {'Name': 'tag:PatchScanAutomationWindow', 'Values': ['Daily']},
-                  {'Name': 'instance-state-name', 'Values': ['running']}
-              ]
+              instances = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:PatchScanAutomation', 'Values': ['Enabled']},
+                      {'Name': 'tag:PatchScanAutomationWindow', 'Values': ['Daily']}
+                  ]
+              )
 
-              instances = ec2.describe_instances(Filters=tag_filters)
-              instance_map = {}
               instance_ids = []
+              instance_map = {}
 
-              for reservation in instances['Reservations']:
-                  for instance in reservation['Instances']:
-                      instance_id = instance['InstanceId']
-                      instance_ids.append(instance_id)
-                      tags = {t['Key']: t['Value'] for t in instance.get('Tags', [])}
-                      instance_map[instance_id] = {
-                          'AppOwner': tags.get('AppOwner'),
-                          'Tags': tags
-                      }
+              for r in instances['Reservations']:
+                  for inst in r['Instances']:
+                      iid = inst['InstanceId']
+                      tags = {t['Key']: t['Value'] for t in inst.get('Tags', [])}
+                      email = tags.get('PatchScanEmailAlert')
+                      if email and "@" in email:
+                          instance_ids.append(iid)
+                          instance_map[iid] = {'email': email, 'tags': tags}
 
               if not instance_ids:
-                  return {"message": "No matching EC2 instances found."}
+                  print("No matching instances found.")
+                  return
 
-              response = ssm.send_command(
+              ssm.send_command(
                   InstanceIds=instance_ids,
                   DocumentName="AWS-RunPatchBaseline",
-                  Parameters={"Operation": ["Scan"]},
-                  TimeoutSeconds=600
+                  Parameters={"Operation": ["Scan"]}
               )
 
-              command_id = response['Command']['CommandId']
+              time.sleep(20)
 
-              for _ in range(40):
-                  time.sleep(15)
-                  invocations = ssm.list_command_invocations(
-                      CommandId=command_id,
-                      Details=True
-                  )
-                  statuses = [i['Status'] for i in invocations['CommandInvocations']]
-                  if all(s in ['Success', 'Failed', 'Cancelled', 'TimedOut'] for s in statuses):
-                      break
-
-              compliance_summary = []
-
-              for instance_id in instance_ids:
+              results = {}
+              for iid in instance_ids:
                   try:
-                      result = ssm.describe_instance_patch_states(InstanceIds=[instance_id])
-                      state = result['InstancePatchStates'][0]
-                      summary = {
-                          'InstanceId': instance_id,
-                          'PatchGroup': state.get('PatchGroup', 'N/A'),
-                          'InstalledCount': state.get('InstalledCount', 0),
-                          'MissingCount': state.get('MissingCount', 0),
-                          'FailedCount': state.get('FailedCount', 0),
-                          'OperationStartTime': str(state.get('OperationStartTime')),
-                          'OperationEndTime': str(state.get('OperationEndTime')),
-                          'ComplianceStatus': state.get('ComplianceStatus'),
+                      state = ssm.describe_instance_patch_states(InstanceIds=[iid])['InstancePatchStates'][0]
+                      results[iid] = {
+                          'ComplianceStatus': state.get('PatchComplianceStatus'),
+                          'MissingCount': state.get('MissingCount'),
+                          'OperationStartTime': state.get('OperationStartTime').isoformat(),
+                          'OperationEndTime': state.get('OperationEndTime').isoformat()
                       }
-                      compliance_summary.append(summary)
-
-                      app_owner = instance_map[instance_id].get('AppOwner')
-                      if app_owner and "@" in app_owner and not is_email_subscribed(app_owner):
-                          sns.subscribe(
-                              TopicArn=SNS_TOPIC_ARN,
-                              Protocol='email',
-                              Endpoint=app_owner
-                          )
-                          ddb.put_item(
-                              TableName=DDB_TABLE_NAME,
-                              Item={'Email': {'S': app_owner}}
-                          )
-                      if app_owner and "@" in app_owner:
-                          sns.publish(
-                              TopicArn=SNS_TOPIC_ARN,
-                              Subject=f"[PatchScan] {instance_id} - {summary['ComplianceStatus']}",
-                              Message=json.dumps(summary, indent=2)
-                          )
                   except Exception as e:
-                      compliance_summary.append({
-                          'InstanceId': instance_id,
-                          'Error': str(e)
-                      })
+                      print(f"Patch state error for {iid}: {e}")
 
-              s3.put_object(
-                  Bucket=BUCKET_NAME,
-                  Key=s3_key,
-                  Body=json.dumps(compliance_summary, indent=2),
-                  ContentType='application/json'
-              )
+              s3_key = f"scans/{today}-scan-results.json"
+              try:
+                  s3.put_object(
+                      Bucket=S3_BUCKET_NAME,
+                      Key=s3_key,
+                      Body=json.dumps(results, indent=2),
+                      ContentType="application/json"
+                  )
+              except Exception as e:
+                  print(f"S3 upload error: {e}")
 
-              return {
-                  'message': f"Patch scan complete for {len(instance_ids)} instances",
-                  's3_result_path': f"s3://{BUCKET_NAME}/{s3_key}",
-                  'results': compliance_summary
-              }
+              for iid, data in results.items():
+                  email = instance_map[iid]['email']
+                  body = json.dumps({iid: data}, indent=2)
+
+                  if not is_email_subscribed(email):
+                      try:
+                          ddb.put_item(TableName=DDB_TABLE_NAME, Item={'Email': {'S': email}})
+                      except Exception as e:
+                          print(f"Error saving {email} to DynamoDB: {e}")
+
+                  try:
+                      ses.send_email(
+                          Source=SES_SENDER,
+                          Destination={'ToAddresses': [email]},
+                          Message={
+                              'Subject': {'Data': f"Patch Scan Result for {iid}"},
+                              'Body': {'Text': {'Data': body}}
+                          }
+                      )
+                      print(f"Sent patch result for {iid} to {email}")
+                  except botocore.exceptions.ClientError as e:
+                      print(f"SES error for {iid}: {e.response['Error']['Message']}")
 
   PatchScanLambdaSchedule:
     Type: AWS::Events::Rule
     Properties:
-      Name: PatchScanWeekdaySchedule
-      ScheduleExpression: cron(30 9 ? * 2-5 *)  # 3:00 PM IST
-      State: ENABLED
+      ScheduleExpression: cron(45 9 ? * 2-5 *) # 3:15 PM IST
       Targets:
-        - Arn: !GetAtt PatchScanLambdaFunction.Arn
+        - Arn: !GetAtt PatchScanLambda.Arn
           Id: PatchScanLambdaTarget
+      State: ENABLED
 
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !Ref PatchScanLambdaFunction
+      FunctionName: !Ref PatchScanLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt PatchScanLambdaSchedule.Arn
-
-Outputs:
-  LambdaFunctionName:
-    Description: Patch Scan Lambda Function
-    Value: !Ref PatchScanLambdaFunction
-
-  S3BucketName:
-    Description: S3 bucket for scan results
-    Value: !Ref PatchScanBucket
-
-  SNSTopic:
-    Description: SNS Topic for AppOwner patch results
-    Value: !Ref DailyPatchScanSNSTopic
-
-  DynamoDBTable:
-    Description: DynamoDB table for tracking subscribed emails
-    Value: !Ref SubscribedEmailsTable
