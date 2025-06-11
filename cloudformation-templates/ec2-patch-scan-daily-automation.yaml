@@ -1,5 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: EC2 Patch Scan Automation with SES Email Notifications
+Description: Daily EC2 Patch Scan with Email Alert using Lambda, SES, SSM, and S3
+
+Parameters:
+  SESVerifiedSender:
+    Type: String
+    Default: noreply@piramal.info
+    Description: Verified SES email address to send from
 
 Resources:
 
@@ -11,176 +17,186 @@ Resources:
   PatchScanDynamoDB:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: SubscribedEmails
+      TableName: PatchScanEmailState
+      BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: Email
+        - AttributeName: InstanceId
           AttributeType: S
       KeySchema:
-        - AttributeName: Email
+        - AttributeName: InstanceId
           KeyType: HASH
-      BillingMode: PAY_PER_REQUEST
 
   PatchScanLambdaRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: PatchScanLambdaExecutionRole
       AssumeRolePolicyDocument:
-        Version: '2012-10-17'
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: PatchScanLambdaPolicy
           PolicyDocument:
-            Version: '2012-10-17'
+            Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
                   - ec2:DescribeInstances
-                  - ssm:SendCommand
                   - ssm:DescribeInstancePatchStates
+                  - ssm:DescribeInstanceInformation
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::ec2-patch-automation/scans/*
+              - Effect: Allow
+                Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
-                  - s3:PutObject
+                Resource: !GetAtt PatchScanDynamoDB.Arn
+              - Effect: Allow
+                Action:
                   - ses:SendEmail
-                Resource: '*'
+                  - ses:SendRawEmail
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
 
   PatchScanLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: PatchScanEmailer
+      FunctionName: PatchScanLambda
       Handler: index.lambda_handler
       Runtime: python3.12
-      Role: !GetAtt PatchScanLambdaRole.Arn
       Timeout: 300
+      Role: !GetAtt PatchScanLambdaRole.Arn
       Environment:
         Variables:
-          DDB_TABLE_NAME: !Ref PatchScanDynamoDB
-          S3_BUCKET_NAME: !Ref PatchScanS3Bucket
-          SES_SENDER: noreply@piramal.info
+          S3_BUCKET_NAME: ec2-patch-automation
+          SES_FROM: !Ref SESVerifiedSender
+          DDB_TABLE_NAME: PatchScanEmailState
       Code:
         ZipFile: |
-          import boto3
-          import os
-          import json
-          import datetime
-          import time
-          import botocore
+          import boto3, os, json
+          from datetime import datetime
+          from botocore.exceptions import ClientError
 
           ec2 = boto3.client('ec2')
           ssm = boto3.client('ssm')
+          ses = boto3.client('ses')
           ddb = boto3.client('dynamodb')
-          s3 = boto3.client('s3')
-          ses = boto3.client('ses', region_name='ap-south-1')
-
-          DDB_TABLE_NAME = os.environ['DDB_TABLE_NAME']
-          S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
-          SES_SENDER = os.environ['SES_SENDER']
-
-          def is_email_subscribed(email):
-              try:
-                  response = ddb.get_item(
-                      TableName=DDB_TABLE_NAME,
-                      Key={'Email': {'S': email}}
-                  )
-                  return 'Item' in response
-              except Exception as e:
-                  print(f"DynamoDB check error for {email}: {e}")
-                  return False
 
           def lambda_handler(event, context):
-              today = datetime.datetime.now().strftime("%Y-%m-%d")
-
-              instances = ec2.describe_instances(
-                  Filters=[
-                      {'Name': 'tag:PatchScanAutomation', 'Values': ['Enabled']},
-                      {'Name': 'tag:PatchScanAutomationWindow', 'Values': ['Daily']}
-                  ]
-              )
-
               instance_ids = []
               instance_map = {}
 
-              for r in instances['Reservations']:
+              reservations = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:PatchScanAutomation', 'Values': ['Enabled']},
+                      {'Name': 'tag:PatchScanAutomationWindow', 'Values': ['Daily']},
+                      {'Name': 'instance-state-name', 'Values': ['running']}
+                  ]
+              )
+
+              for r in reservations['Reservations']:
                   for inst in r['Instances']:
                       iid = inst['InstanceId']
                       tags = {t['Key']: t['Value'] for t in inst.get('Tags', [])}
                       email = tags.get('PatchScanEmailAlert')
                       if email and "@" in email:
                           instance_ids.append(iid)
-                          instance_map[iid] = {'email': email, 'tags': tags}
+                          instance_map[iid] = {
+                              'email': email,
+                              'hostname': inst.get('PrivateDnsName', 'N/A'),
+                              'private_ip': inst.get('PrivateIpAddress', 'N/A')
+                          }
 
               if not instance_ids:
-                  print("No matching instances found.")
-                  return
+                  return {"message": "No tagged instances found."}
 
-              ssm.send_command(
-                  InstanceIds=instance_ids,
-                  DocumentName="AWS-RunPatchBaseline",
-                  Parameters={"Operation": ["Scan"]}
-              )
-
-              time.sleep(20)
-
+              response = ssm.describe_instance_patch_states(InstanceIds=instance_ids)
               results = {}
-              for iid in instance_ids:
-                  try:
-                      state = ssm.describe_instance_patch_states(InstanceIds=[iid])['InstancePatchStates'][0]
-                      results[iid] = {
-                          'ComplianceStatus': state.get('PatchComplianceStatus'),
-                          'MissingCount': state.get('MissingCount'),
-                          'OperationStartTime': state.get('OperationStartTime').isoformat(),
-                          'OperationEndTime': state.get('OperationEndTime').isoformat()
-                      }
-                  except Exception as e:
-                      print(f"Patch state error for {iid}: {e}")
 
-              s3_key = f"scans/{today}-scan-results.json"
-              try:
-                  s3.put_object(
-                      Bucket=S3_BUCKET_NAME,
-                      Key=s3_key,
-                      Body=json.dumps(results, indent=2),
-                      ContentType="application/json"
-                  )
-              except Exception as e:
-                  print(f"S3 upload error: {e}")
-
-              for iid, data in results.items():
+              for state in response['InstancePatchStates']:
+                  iid = state['InstanceId']
                   email = instance_map[iid]['email']
-                  body = json.dumps({iid: data}, indent=2)
+                  hostname = instance_map[iid]['hostname']
+                  private_ip = instance_map[iid]['private_ip']
 
-                  if not is_email_subscribed(email):
-                      try:
-                          ddb.put_item(TableName=DDB_TABLE_NAME, Item={'Email': {'S': email}})
-                      except Exception as e:
-                          print(f"Error saving {email} to DynamoDB: {e}")
+                  missing = state.get('MissingCount', 0)
+                  compliance = state.get('ComplianceStatus', 'Unknown')
+                  start_time = state.get('OperationStartTime')
+                  end_time = state.get('OperationEndTime')
+
+                  results[iid] = {
+                      'Hostname': hostname,
+                      'PrivateIP': private_ip,
+                      'MissingCount': missing,
+                      'ComplianceStatus': compliance,
+                      'OperationStartTime': str(start_time),
+                      'OperationEndTime': str(end_time)
+                  }
+
+                  body = (
+                      f"Patch Scan Result:\n\n"
+                      f"Instance ID: {iid}\n"
+                      f"Hostname: {hostname}\n"
+                      f"Private IP: {private_ip}\n"
+                      f"Missing Patches: {missing}\n"
+                      f"Compliance Status: {compliance}\n"
+                      f"Operation Time: {start_time} to {end_time} UTC\n"
+                  )
 
                   try:
                       ses.send_email(
-                          Source=SES_SENDER,
+                          Source=os.environ['SES_FROM'],
                           Destination={'ToAddresses': [email]},
                           Message={
-                              'Subject': {'Data': f"Patch Scan Result for {iid}"},
+                              'Subject': {'Data': f'Patch Scan Report for {iid}'},
                               'Body': {'Text': {'Data': body}}
                           }
                       )
-                      print(f"Sent patch result for {iid} to {email}")
-                  except botocore.exceptions.ClientError as e:
+                  except ClientError as e:
                       print(f"SES error for {iid}: {e.response['Error']['Message']}")
 
-  PatchScanLambdaSchedule:
+                  # Store latest state to DynamoDB
+                  try:
+                      ddb.put_item(
+                          TableName=os.environ['DDB_TABLE_NAME'],
+                          Item={
+                              'InstanceId': {'S': iid},
+                              'LastEmailSent': {'S': datetime.utcnow().isoformat()}
+                          }
+                      )
+                  except Exception as e:
+                      print(f"DynamoDB put error for {iid}: {str(e)}")
+
+              # Save to S3
+              s3 = boto3.client('s3')
+              s3.put_object(
+                  Bucket=os.environ['S3_BUCKET_NAME'],
+                  Key=f'scans/{datetime.utcnow().strftime("%y-%m-%d")}-scan-results.json',
+                  Body=json.dumps(results, indent=2)
+              )
+
+              return {"status": "Scan completed", "instances": len(instance_ids)}
+
+  PatchScanSchedule:
     Type: AWS::Events::Rule
     Properties:
-      ScheduleExpression: cron(45 9 ? * 2-5 *) # 3:15 PM IST
+      Name: PatchScanLambdaSchedule
+      ScheduleExpression: cron(00 11 ? * 2-5 *)  # 4:30 PM IST = 15:15 UTC, Mon-Thu
+      State: ENABLED
       Targets:
         - Arn: !GetAtt PatchScanLambda.Arn
-          Id: PatchScanLambdaTarget
-      State: ENABLED
+          Id: TargetFunctionV1
 
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
@@ -188,4 +204,12 @@ Resources:
       FunctionName: !Ref PatchScanLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt PatchScanLambdaSchedule.Arn
+      SourceArn: !GetAtt PatchScanSchedule.Arn
+
+Outputs:
+  LambdaName:
+    Value: !Ref PatchScanLambda
+  S3Bucket:
+    Value: !Ref PatchScanS3Bucket
+  Schedule:
+    Value: "Mon?Thu at 8:45 PM IST"
